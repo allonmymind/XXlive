@@ -19,7 +19,7 @@ jobs:
       - name: Setup Java & Android
         uses: android-actions/setup-android@v3
 
-      # 3. 彻底禁用Gradle自动签名 - 修复这里！
+      # 3. 彻底禁用Gradle自动签名 - 修复版本
       - name: Disable ALL Gradle signing
         run: |
           echo "🛑 彻底禁用Gradle自动签名..."
@@ -28,16 +28,14 @@ jobs:
           rm -f app/*.keystore app/*.jks
           rm -f app/build/outputs/apk/release/signingKey.jks
           
-          # 创建假的签名配置，确保Gradle不签名
-          cat > gradle.properties << 'EOF'
-# 强制禁用自动签名
-android.injected.signing.store.file=/dev/null
-android.injected.signing.store.password=none
-android.injected.signing.key.alias=none
-android.injected.signing.key.password=none
-# 禁用Android Studio自动签名
-android.defaults.signing.enabled=false
-EOF
+          # 使用echo创建文件，避免heredoc问题
+          echo "# 强制禁用自动签名" > gradle.properties
+          echo "android.injected.signing.store.file=/dev/null" >> gradle.properties
+          echo "android.injected.signing.store.password=none" >> gradle.properties
+          echo "android.injected.signing.key.alias=none" >> gradle.properties
+          echo "android.injected.signing.key.password=none" >> gradle.properties
+          echo "# 禁用Android Studio自动签名" >> gradle.properties
+          echo "android.defaults.signing.enabled=false" >> gradle.properties
 
       # 4. 构建完全未签名的APK
       - name: Build UNSIGNED APK
