@@ -13,35 +13,87 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: set up JDK 21
+      - name: Set up JDK 11 (使用JDK 11，兼容性更好)
         uses: actions/setup-java@v4
         with:
-          java-version: '21'
+          java-version: '11'  # 从21改为11，Android构建兼容性更好
           distribution: 'temurin'
           cache: 'gradle'
 
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: Run build with Gradle wrapper
-        run: ./gradlew clean && ./gradlew assembleRelease
-
-      - name: Sign app APK
+        run: |
+          chmod +x gradlew
+          ./gradlew clean && ./gradlew assembleRelease
+          
+      # 🔐 关键修改：替换签名步骤
+      - name: Sign APK with consistent keystore (支持覆盖安装)
         id: sign_app
-        uses: r0adkll/sign-android-release@v1
-        with:
-          releaseDirectory: app/build/outputs/apk/release
-          alias: ${{ secrets.ALIAS }}
-          signingKeyBase64: ${{ secrets.KEYSTORE }}
-          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
-          keyPassword: ${{ secrets.ALIAS_PASSWORD }}
         env:
-          # override default build-tools version (29.0.3) -- optional
-          BUILD_TOOLS_VERSION: "34.0.0"
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE }}
+          STORE_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.KEY_PASSWORD }}
+          ALIAS_NAME: ${{ secrets.KEY_ALIAS }}
+        run: |
+          echo "🔧 开始使用统一密钥签名（支持覆盖安装）..."
+          
+          # 1. 从Secrets解码keystore
+          echo "$KEYSTORE_BASE64" | base64 --decode > release.keystore
+          
+          # 2. 验证keystore文件
+          echo "📋 验证keystore..."
+          keytool -list -v \
+            -keystore release.keystore \
+            -storepass "$STORE_PASS" \
+            -alias "$ALIAS_NAME" 2>/dev/null || echo "⚠️ 密码验证可能需要检查"
+          
+          # 3. 对齐APK（zipalign）
+          echo "📐 对齐APK文件..."
+          INPUT_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          ALIGNED_APK="app/build/outputs/apk/release/app-release-aligned.apk"
+          
+          $ANDROID_HOME/build-tools/34.0.0/zipalign -v -p 4 "$INPUT_APK" "$ALIGNED_APK"
+          
+          # 4. 签名APK（启用v1签名确保Android 4.4兼容）
+          echo "🖊️ 签名APK..."
+          SIGNED_APK="app/build/outputs/apk/release/app-release-signed.apk"
+          
+          $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+            --ks release.keystore \
+            --ks-pass pass:"$STORE_PASS" \
+            --key-pass pass:"$KEY_PASS" \
+            --ks-key-alias "$ALIAS_NAME" \
+            --v1-signing-enabled true \      # Android 4.4必须启用
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out "$SIGNED_APK" \
+            "$ALIGNED_APK"
+          
+          # 5. 验证签名
+          echo "✅ 验证签名..."
+          $ANDROID_HOME/build-tools/34.0.0/apksigner verify --verbose "$SIGNED_APK"
+          
+          # 6. 输出签名文件路径（供后续步骤使用）
+          echo "signedReleaseFile=$SIGNED_APK" >> $GITHUB_OUTPUT
+          echo "📊 签名完成！文件：$SIGNED_APK"
+          
+          # 7. 清理临时文件
+          rm -f release.keystore "$ALIGNED_APK"
 
+      # 以下步骤保持不变，只修改引用
       - name: Get History
         id: get_history
         run: |
-          chmod +x history.sh
-          output=$(./history.sh)
-          echo "$output" > history.md
+          if [ -f history.sh ]; then
+            chmod +x history.sh
+            output=$(./history.sh)
+            echo "$output" > history.md
+          else
+            echo "# 发布说明" > history.md
+            echo "使用统一签名密钥构建，支持覆盖安装。" >> history.md
+          fi
 
       - name: Create Release
         id: create_release
@@ -59,8 +111,10 @@ jobs:
         id: set_asset_name
         run: |
           VERSION_WITHOUT_V=$(echo '${{ github.ref_name }}' | sed 's/^v//')
-          echo "asset_name=my-tv-0_${VERSION_WITHOUT_V}.apk" >> $GITHUB_ENV
+          echo "asset_name=my-tv-0_${VERSION_WITHOUT_V}_signed.apk" >> $GITHUB_ENV
+          echo "📦 资源文件名：my-tv-0_${VERSION_WITHOUT_V}_signed.apk"
 
+      # 注意：这里引用的路径已改为我们新签名的APK
       - name: Upload Release Asset
         uses: actions/upload-release-asset@v1
         env:
@@ -70,18 +124,3 @@ jobs:
           asset_path: ${{ steps.sign_app.outputs.signedReleaseFile }}
           asset_name: ${{ env.asset_name }}
           asset_content_type: application/vnd.android.package-archive
-
-#      - name: Gitee Create Release
-#        run: |
-#          latest_commit=$(git rev-parse HEAD)
-#          history=$(cat history.md)
-#          curl -v POST https://gitee.com/api/v5/repos/${{ github.repository }}/releases \
-#          -H "Content-Type: application/json" \
-#          -d '{
-#            "access_token": "${{ secrets.GITEE_ACCESS_TOKEN}}",
-#            "tag_name": "${{ github.ref_name }}",
-#            "name": "Release ${{ github.ref_name }}",
-#            "body": "'"$history"'",
-#            "prerelease": false,
-#            "target_commitish": "'"$latest_commit"'"
-#          }'
