@@ -1,87 +1,121 @@
-name: build
+name: Android Build for All Branches
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: write
+    inputs:
+      target_branch:
+        description: '要构建的分支'
+        required: true
+        default: 'kitkat'
+        type: choice
+        options:
+          - kitkat
+          - main
+          - develop
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    
     steps:
-      - name: Checkout code
+      # 1. 检出指定分支的代码
+      - name: Checkout selected branch
         uses: actions/checkout@v4
-
-      - name: set up JDK 21
-        uses: actions/setup-java@v4
         with:
-          java-version: '21'
-          distribution: 'temurin'
-          cache: 'gradle'
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
 
-      - name: Run build with Gradle wrapper
-        run: ./gradlew clean && ./gradlew assembleRelease
+      # 2. 设置环境
+      - name: Setup Java & Android
+        uses: android-actions/setup-android@v3
 
-      - name: Sign app APK
-        id: sign_app
-        uses: r0adkll/sign-android-release@v1
-        with:
-          releaseDirectory: app/build/outputs/apk/release
-          alias: ${{ secrets.ALIAS }}
-          signingKeyBase64: ${{ secrets.KEYSTORE }}
-          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
-          keyPassword: ${{ secrets.ALIAS_PASSWORD }}
-        env:
-          # override default build-tools version (29.0.3) -- optional
-          BUILD_TOOLS_VERSION: "34.0.0"
-
-      - name: Get History
-        id: get_history
+      # 3. 根据分支进行不同配置
+      - name: Configure for branch
         run: |
-          chmod +x history.sh
-          output=$(./history.sh)
-          echo "$output" > history.md
+          echo "🔧 配置分支: ${{ inputs.target_branch }}"
+          
+          if [ "${{ inputs.target_branch }}" = "kitkat" ]; then
+            echo "🎯 这是 Android 4.4 兼容分支"
+            # 添加 Android 4.4 特定配置
+            echo "android.defaults.buildtools.version=30.0.3" >> gradle.properties
+            echo "android.defaults.compileSdk=19" >> gradle.properties
+          else
+            echo "📱 这是标准分支"
+          fi
+          
+          # 禁用 Gradle 自动签名
+          echo "# 强制禁用自动签名" > gradle.properties
+          echo "android.injected.signing.store.file=/dev/null" >> gradle.properties
+          echo "android.injected.signing.store.password=none" >> gradle.properties
+          echo "android.injected.signing.key.alias=none" >> gradle.properties
+          echo "android.injected.signing.key.password=none" >> gradle.properties
 
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      # 4. 构建未签名APK
+      - name: Build UNSIGNED APK
+        run: |
+          chmod +x gradlew
+          echo "🏗️ 构建未签名APK..."
+          
+          ./gradlew clean
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=/dev/null \
+            -Pandroid.injected.signing.store.password=none \
+            -Pandroid.injected.signing.key.alias=none \
+            -Pandroid.injected.signing.key.password=none
+          
+          echo "✅ 生成的APK文件："
+          find app/build/outputs/apk -name "*.apk" -type f | xargs ls -la
+
+      # 5. 手动签名（使用你的统一keystore）
+      - name: Sign APK Manually
+        id: sign_apk
+        env:
+          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE }}
+        run: |
+          echo "🔐 开始手动签名..."
+          
+          # 解码keystore
+          echo "$KEYSTORE_BASE64" | base64 --decode > myapp.keystore
+          
+          # 查找APK
+          UNSIGNED_APK=$(find app/build/outputs/apk -name "*unsigned*.apk" -o -name "app-release.apk" | head -1)
+          
+          # 对齐
+          ALIGNED_APK="${UNSIGNED_APK%.apk}-aligned.apk"
+          $ANDROID_HOME/build-tools/34.0.0/zipalign -v -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+          
+          # 签名
+          SIGNED_APK="app/build/outputs/apk/release/app-release-signed.apk"
+          $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+            --ks myapp.keystore \
+            --ks-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
+            --key-pass pass:"${{ secrets.KEY_PASSWORD }}" \
+            --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --out "$SIGNED_APK" \
+            "$ALIGNED_APK"
+          
+          echo "signedReleaseFile=$SIGNED_APK" >> $GITHUB_OUTPUT
+
+      # 6. 创建发布
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
+          tag_name: "build-${{ github.run_id }}-${{ inputs.target_branch }}"
+          name: "Build from ${{ inputs.target_branch }}"
+          body: |
+            🚀 **分支构建: ${{ inputs.target_branch }}**
+            
+            构建ID: ${{ github.run_id }}
+            分支: ${{ inputs.target_branch }}
+            时间: $(date)
+            
+            ✅ **支持覆盖安装**
+            ✅ **使用统一签名密钥**
+            ✅ **Android 4.4+ 兼容**
+          files: ${{ steps.sign_apk.outputs.signedReleaseFile }}
           draft: false
           prerelease: false
-          body_path: history.md
-
-      - name: Set Asset Name
-        id: set_asset_name
-        run: |
-          VERSION_WITHOUT_V=$(echo '${{ github.ref_name }}' | sed 's/^v//')
-          echo "asset_name=my-tv-0_${VERSION_WITHOUT_V}.apk" >> $GITHUB_ENV
-
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ${{ steps.sign_app.outputs.signedReleaseFile }}
-          asset_name: ${{ env.asset_name }}
-          asset_content_type: application/vnd.android.package-archive
-
-#      - name: Gitee Create Release
-#        run: |
-#          latest_commit=$(git rev-parse HEAD)
-#          history=$(cat history.md)
-#          curl -v POST https://gitee.com/api/v5/repos/${{ github.repository }}/releases \
-#          -H "Content-Type: application/json" \
-#          -d '{
-#            "access_token": "${{ secrets.GITEE_ACCESS_TOKEN}}",
-#            "tag_name": "${{ github.ref_name }}",
-#            "name": "Release ${{ github.ref_name }}",
-#            "body": "'"$history"'",
-#            "prerelease": false,
-#            "target_commitish": "'"$latest_commit"'"
-#          }'
