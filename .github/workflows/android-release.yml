@@ -1,121 +1,101 @@
-name: Android Build for All Branches
+name: build-with-new-keystore
 
 on:
-  workflow_dispatch:
-    inputs:
-      target_branch:
-        description: '要构建的分支'
-        required: true
-        default: 'kitkat'
-        type: choice
-        options:
-          - kitkat
-          - main
-          - develop
+  workflow_dispatch: 
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
     steps:
-      # 1. 检出指定分支的代码
-      - name: Checkout selected branch
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.target_branch }}
-          fetch-depth: 0
 
-      # 2. 设置环境
-      - name: Setup Java & Android
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      # 3. 根据分支进行不同配置
-      - name: Configure for branch
-        run: |
-          echo "🔧 配置分支: ${{ inputs.target_branch }}"
-          
-          if [ "${{ inputs.target_branch }}" = "kitkat" ]; then
-            echo "🎯 这是 Android 4.4 兼容分支"
-            # 添加 Android 4.4 特定配置
-            echo "android.defaults.buildtools.version=30.0.3" >> gradle.properties
-            echo "android.defaults.compileSdk=19" >> gradle.properties
-          else
-            echo "📱 这是标准分支"
-          fi
-          
-          # 禁用 Gradle 自动签名
-          echo "# 强制禁用自动签名" > gradle.properties
-          echo "android.injected.signing.store.file=/dev/null" >> gradle.properties
-          echo "android.injected.signing.store.password=none" >> gradle.properties
-          echo "android.injected.signing.key.alias=none" >> gradle.properties
-          echo "android.injected.signing.key.password=none" >> gradle.properties
+      - name: Run build with Gradle wrapper
+        run: ./gradlew clean && ./gradlew assembleRelease
 
-      # 4. 构建未签名APK
-      - name: Build UNSIGNED APK
+      # 创建新的keystore
+      - name: Create New Keystore
+        id: create_keystore
         run: |
-          chmod +x gradlew
-          echo "🏗️ 构建未签名APK..."
+          echo "创建新的keystore..."
           
-          ./gradlew clean
-          ./gradlew assembleRelease \
-            -Pandroid.injected.signing.store.file=/dev/null \
-            -Pandroid.injected.signing.store.password=none \
-            -Pandroid.injected.signing.key.alias=none \
-            -Pandroid.injected.signing.key.password=none
+          # 设置密码（您可以修改这些值）
+          STORE_PASS="AndroidRelease123"
+          KEY_PASS="AndroidRelease123"
+          ALIAS_NAME="myapp"
           
-          echo "✅ 生成的APK文件："
-          find app/build/outputs/apk -name "*.apk" -type f | xargs ls -la
+          # 生成keystore
+          keytool -genkeypair \
+            -keystore new.keystore \
+            -alias "$ALIAS_NAME" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass "$STORE_PASS" \
+            -keypass "$KEY_PASS" \
+            -dname "CN=MyApp, OU=Development, O=MyCompany, L=City, ST=State, C=CN" \
+            -noprompt
+          
+          echo "keystore创建成功！"
+          echo "store_pass=$STORE_PASS" >> $GITHUB_OUTPUT
+          echo "key_pass=$KEY_PASS" >> $GITHUB_OUTPUT
+          echo "alias_name=$ALIAS_NAME" >> $GITHUB_OUTPUT
 
-      # 5. 手动签名（使用你的统一keystore）
-      - name: Sign APK Manually
-        id: sign_apk
-        env:
-          KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE }}
+      - name: Sign APK with New Keystore
         run: |
-          echo "🔐 开始手动签名..."
+          echo "使用新keystore签名..."
           
-          # 解码keystore
-          echo "$KEYSTORE_BASE64" | base64 --decode > myapp.keystore
+          # 对齐APK
+          $ANDROID_HOME/build-tools/34.0.0/zipalign -v -p 4 \
+            app/build/outputs/apk/release/app-release-unsigned.apk \
+            app/build/outputs/apk/release/app-release-aligned.apk
           
-          # 查找APK
-          UNSIGNED_APK=$(find app/build/outputs/apk -name "*unsigned*.apk" -o -name "app-release.apk" | head -1)
-          
-          # 对齐
-          ALIGNED_APK="${UNSIGNED_APK%.apk}-aligned.apk"
-          $ANDROID_HOME/build-tools/34.0.0/zipalign -v -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
-          
-          # 签名
-          SIGNED_APK="app/build/outputs/apk/release/app-release-signed.apk"
+          # 签名APK
           $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
-            --ks myapp.keystore \
-            --ks-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
-            --key-pass pass:"${{ secrets.KEY_PASSWORD }}" \
-            --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
-            --v1-signing-enabled true \
-            --v2-signing-enabled true \
-            --out "$SIGNED_APK" \
-            "$ALIGNED_APK"
+            --ks new.keystore \
+            --ks-pass pass:"${{ steps.create_keystore.outputs.store_pass }}" \
+            --key-pass pass:"${{ steps.create_keystore.outputs.key_pass }}" \
+            --ks-key-alias "${{ steps.create_keystore.outputs.alias_name }}" \
+            --out app/build/outputs/apk/release/app-release-signed.apk \
+            app/build/outputs/apk/release/app-release-aligned.apk
           
-          echo "signedReleaseFile=$SIGNED_APK" >> $GITHUB_OUTPUT
+          echo "签名完成！"
+          echo "密码信息（请保存）："
+          echo "密钥库密码: ${{ steps.create_keystore.outputs.store_pass }}"
+          echo "别名密码: ${{ steps.create_keystore.outputs.key_pass }}"
+          echo "别名: ${{ steps.create_keystore.outputs.alias_name }}"
 
-      # 6. 创建发布
-      - name: Create GitHub Release
+      - name: Create Release
         uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
+          body: |
+            🔐 使用新密钥签名的版本
+            
+            版本: ${{ github.ref_name }}
+            构建时间: $(date)
+            
+            ⚠️ 注意：
+            - 此版本使用自动生成的密钥签名
+            - 如需升级应用，需使用相同密钥签名
+            - 请保存以下密钥信息：
+              - 别名: ${{ steps.create_keystore.outputs.alias_name }}
+              - 密钥库密码: ${{ steps.create_keystore.outputs.store_pass }}
+              - 别名密码: ${{ steps.create_keystore.outputs.key_pass }}
+          files: app/build/outputs/apk/release/app-release-signed.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: "build-${{ github.run_id }}-${{ inputs.target_branch }}"
-          name: "Build from ${{ inputs.target_branch }}"
-          body: |
-            🚀 **分支构建: ${{ inputs.target_branch }}**
-            
-            构建ID: ${{ github.run_id }}
-            分支: ${{ inputs.target_branch }}
-            时间: $(date)
-            
-            ✅ **支持覆盖安装**
-            ✅ **使用统一签名密钥**
-            ✅ **Android 4.4+ 兼容**
-          files: ${{ steps.sign_apk.outputs.signedReleaseFile }}
-          draft: false
-          prerelease: false
