@@ -19,7 +19,7 @@ jobs:
     - name: Setup Java & Android
       uses: android-actions/setup-android@v3
 
-    # 3. 彻底禁用Gradle自动签名 🔥
+    # 3. 彻底禁用Gradle自动签名
     - name: Disable ALL Gradle signing
       run: |
         echo "🛑 彻底禁用Gradle自动签名..."
@@ -58,7 +58,7 @@ EOF
         echo "✅ 检查生成的APK文件："
         find app/build/outputs/apk -name "*.apk" -type f | xargs ls -la
 
-    # 5. 🔐 手动签名（核心步骤）
+    # 5. 手动签名（核心步骤）
     - name: Manual APK Signing
       id: sign_apk
       env:
