@@ -1,0 +1,186 @@
+name: Android Release (Manual Signing)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    # 1. 检出代码
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 2. 设置环境
+    - name: Setup Java & Android
+      uses: android-actions/setup-android@v3
+
+    # 3. 彻底禁用Gradle自动签名 🔥
+    - name: Disable ALL Gradle signing
+      run: |
+        echo "🛑 彻底禁用Gradle自动签名..."
+        
+        # 删除所有可能存在的签名文件
+        rm -f app/*.keystore app/*.jks
+        rm -f app/build/outputs/apk/release/signingKey.jks
+        
+        # 创建假的签名配置，确保Gradle不签名
+        cat > gradle.properties << 'EOF'
+# 强制禁用自动签名
+android.injected.signing.store.file=/dev/null
+android.injected.signing.store.password=none
+android.injected.signing.key.alias=none
+android.injected.signing.key.password=none
+# 禁用Android Studio自动签名
+android.defaults.signing.enabled=false
+EOF
+
+    # 4. 构建完全未签名的APK
+    - name: Build UNSIGNED APK
+      run: |
+        chmod +x gradlew
+        echo "🏗️ 构建完全未签名的APK..."
+        
+        # 使用这些参数确保不签名
+        ./gradlew clean
+        
+        # 关键：使用assemble，不要用bundle
+        ./gradlew assembleRelease \
+          -Pandroid.injected.signing.store.file=/dev/null \
+          -Pandroid.injected.signing.store.password=none \
+          -Pandroid.injected.signing.key.alias=none \
+          -Pandroid.injected.signing.key.password=none
+        
+        echo "✅ 检查生成的APK文件："
+        find app/build/outputs/apk -name "*.apk" -type f | xargs ls -la
+
+    # 5. 🔐 手动签名（核心步骤）
+    - name: Manual APK Signing
+      id: sign_apk
+      env:
+        KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE }}
+      run: |
+        echo "🔐 =========== 开始手动签名 ==========="
+        
+        # 1. 解码keystore
+        echo "📥 解码keystore..."
+        echo "$KEYSTORE_BASE64" | base64 --decode > myapp.keystore
+        
+        # 2. 验证keystore
+        echo "🔍 验证keystore..."
+        echo "文件类型:"
+        file myapp.keystore
+        echo "文件大小: $(wc -c < myapp.keystore) bytes"
+        
+        # 3. 查找未签名的APK
+        echo "📦 查找APK文件..."
+        # 优先找未签名的，如果找不到就找release的
+        UNSIGNED_APK=""
+        if [ -f "app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
+          UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+        elif [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
+          UNSIGNED_APK="app/build/outputs/apk/release/app-release.apk"
+        else
+          # 查找任意release APK
+          UNSIGNED_APK=$(find app/build/outputs/apk -name "*release*.apk" -type f | head -1)
+        fi
+        
+        if [ -z "$UNSIGNED_APK" ]; then
+          echo "❌ 错误：未找到APK文件！"
+          find app/build/outputs/apk -type f | xargs ls -la
+          exit 1
+        fi
+        
+        echo "✅ 找到APK: $UNSIGNED_APK"
+        
+        # 4. 对齐APK
+        echo "📐 对齐APK..."
+        ALIGNED_APK="${UNSIGNED_APK%.apk}-aligned.apk"
+        $ANDROID_HOME/build-tools/34.0.0/zipalign -v -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+        
+        # 5. 签名APK（关键：使用JKS格式）
+        echo "🖊️ 签名APK..."
+        SIGNED_APK="app/build/outputs/apk/release/app-release-FINAL.apk"
+        
+        # 直接尝试使用你的keystore，如果失败则转换格式
+        $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+          --ks myapp.keystore \
+          --ks-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
+          --key-pass pass:"${{ secrets.KEY_PASSWORD }}" \
+          --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+          --v1-signing-enabled true \
+          --v2-signing-enabled true \
+          --out "$SIGNED_APK" \
+          "$ALIGNED_APK" || {
+            echo "⚠️ 第一次签名尝试失败，尝试转换格式..."
+            # 转换为JKS格式
+            keytool -importkeystore \
+              -srckeystore myapp.keystore \
+              -destkeystore myapp.jks \
+              -deststoretype JKS \
+              -srcstorepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+              -deststorepass "${{ secrets.KEYSTORE_PASSWORD }}" \
+              -srcalias "${{ secrets.KEY_ALIAS }}" \
+              -destalias "${{ secrets.KEY_ALIAS }}" \
+              -noprompt
+            
+            # 使用JKS格式重新签名
+            $ANDROID_HOME/build-tools/34.0.0/apksigner sign \
+              --ks myapp.jks \
+              --ks-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
+              --key-pass pass:"${{ secrets.KEY_PASSWORD }}" \
+              --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --out "$SIGNED_APK" \
+              "$ALIGNED_APK"
+          }
+        
+        # 6. 验证签名
+        echo "✅ 验证签名..."
+        $ANDROID_HOME/build-tools/34.0.0/apksigner verify --verbose "$SIGNED_APK"
+        
+        # 7. 输出结果
+        echo "signedReleaseFile=$SIGNED_APK" >> $GITHUB_OUTPUT
+        echo "🎉 =========== 签名成功！ ==========="
+        
+        # 8. 显示最终文件
+        echo "📊 最终文件："
+        ls -la "$SIGNED_APK"
+        echo "文件大小: $(wc -c < "$SIGNED_APK") bytes"
+
+    # 6. 创建发布
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: "Release ${{ github.ref_name }}"
+        body: |
+          🚀 **Android APK 发布**
+          
+          **版本:** ${{ github.ref_name }}
+          **构建时间:** $(date)
+          
+          ✅ **支持覆盖安装**（使用统一密钥）
+          ✅ **Android 4.4+ 兼容**（包含V1签名）
+          ✅ **证书指纹一致**（可安全更新）
+          
+          🔧 **技术信息:**
+          - 签名方式: 手动签名
+          - 密钥类型: JKS
+          - 签名版本: V1 + V2
+          - 最小SDK: Android 4.4 (API 19)
+          
+          📱 **安装说明:**
+          1. 下载APK文件
+          2. 直接安装即可覆盖旧版本
+          3. 应用数据将自动保留
+        files: ${{ steps.sign_apk.outputs.signedReleaseFile }}
+        draft: false
+        prerelease: false
